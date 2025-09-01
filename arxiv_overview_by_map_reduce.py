@@ -18,7 +18,7 @@ except ImportError:
     PDF_PROCESSING_AVAILABLE = False
     print("警告: PyPDF2未安装，将使用论文摘要而不是完整内容")
 from typing import List, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
 from langchain_openai import ChatOpenAI
 # 添加LangSmith追踪导入
 from langsmith import traceable, Client
@@ -27,6 +27,8 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 import warnings
+
+max_papers = 20
 
 # 过滤distutils相关的弃用警告
 warnings.filterwarnings("ignore", category=UserWarning, message=".*distutils.*")
@@ -140,7 +142,7 @@ class ArxivReviewGenerator:
             return query
     
     @traceable
-    def search_papers(self, query: str, max_results: int = 5) -> List[Dict]:
+    def search_papers(self, query: str, max_results: int = max_papers) -> List[Dict]:
         """搜索arxiv论文"""
         print(f"🔍 开始搜索论文，查询词: '{query}'")
         # 首先尝试翻译查询词
@@ -154,46 +156,221 @@ class ArxivReviewGenerator:
         try:
             print(f"🔍 正在使用查询词搜索论文: '{search_query}'")
             client = arxiv.Client()
+            
+            # 计算两年前的日期
+            two_years_ago = datetime.now().replace(tzinfo=None) - timedelta(days=365*2)
+            
             search = arxiv.Search(
                 query=search_query,
-                max_results=max_results,
+                max_results=max_results * 2,  # 搜索更多论文以补偿筛选
                 sort_by=arxiv.SortCriterion.Relevance,
                 sort_order=arxiv.SortOrder.Descending
             )
             
+            results = list(client.results(search))
             papers = []
-            for i, result in enumerate(client.results(search)):
-                print(f"📄 获取到论文 {i+1}: {result.title}")
-                paper = {
-                    "title": result.title,
-                    "authors": [author.name for author in result.authors],
-                    "summary": result.summary,
-                    "published": result.published.strftime("%Y-%m-%d"),
-                    "pdf_url": result.pdf_url,
-                    "entry_id": result.entry_id,
-                    "categories": result.categories
+            
+            # 筛选最近两年的论文
+            filtered_results = []
+            for result in results:
+                published_date = result.published.replace(tzinfo=None)
+                if published_date >= two_years_ago:
+                    filtered_results.append(result)
+            
+            print(f"📅 筛选最近两年论文: {len(results)} -> {len(filtered_results)}")
+            
+            # 使用线程池并行处理论文
+            with ThreadPoolExecutor(max_workers=25) as executor:
+                # 提交所有任务
+                future_to_index = {
+                    executor.submit(self._process_paper_result, result): i 
+                    for i, result in enumerate(filtered_results[:max_results])
                 }
                 
-                # 尝试提取PDF内容
-                if PDF_PROCESSING_AVAILABLE:
+                # 收集结果
+                for future in tqdm(as_completed(future_to_index), 
+                                 total=len(future_to_index), 
+                                 desc="处理论文", 
+                                 colour="GREEN"):
                     try:
-                        print(f"📄 正在提取论文PDF内容: {result.title}")
-                        paper["full_content"] = self._extract_pdf_content(result.pdf_url)
-                        print(f"✅ 论文PDF内容提取完成: {result.title}")
+                        paper = future.result(timeout=600)
+                        papers.append(paper)
                     except Exception as e:
-                        print(f"⚠️ 提取PDF内容时出错: {str(e)}, 使用摘要内容")
-                        paper["full_content"] = result.summary
-                else:
-                    paper["full_content"] = result.summary
-                    print(f"📄 使用论文摘要内容: {result.title}")
-                    
-                papers.append(paper)
+                        index = future_to_index[future]
+                        print(f"⚠️ 处理第 {index + 1} 篇论文时出错: {e}")
             
             print(f"✅ 论文搜索完成，共找到 {len(papers)} 篇论文")
+            
+            # 使用规划器评估论文相关性并调整关键词
+            papers = self._planner_filter_papers(papers, query, max_results)
+            
             return papers
         except Exception as e:
             print(f"搜索论文时出错: {str(e)}")
             return []
+    
+    def _planner_filter_papers(self, papers: List[Dict], original_query: str, max_results: int) -> List[Dict]:
+        """使用规划器评估论文相关性并过滤不相关论文"""
+        if not papers:
+            return papers
+            
+        print(f"🧠 规划器开始评估 {len(papers)} 篇论文的相关性")
+        
+        # 评估每篇论文与原始查询的相关性
+        relevant_papers = []
+        irrelevant_papers = []
+        
+        for paper in papers:
+            is_relevant = self._evaluate_paper_relevance(paper, original_query)
+            if is_relevant:
+                relevant_papers.append(paper)
+            else:
+                irrelevant_papers.append(paper)
+        
+        print(f"✅ 规划器评估完成: {len(relevant_papers)} 篇相关, {len(irrelevant_papers)} 篇不相关")
+        
+        # 如果相关论文数量不足，尝试调整关键词重新搜索
+        if len(relevant_papers) < max_results * 0.7:  # 如果相关论文少于70%
+            print(f"⚠️ 相关论文不足，正在调整关键词重新搜索...")
+            additional_papers = self._search_additional_papers(original_query, max_results - len(relevant_papers), papers)
+            relevant_papers.extend(additional_papers)
+        
+        # 返回相关论文，限制数量
+        return relevant_papers[:max_results]
+    
+    def _evaluate_paper_relevance(self, paper: Dict, query: str) -> bool:
+        """评估单篇论文与查询的相关性"""
+        try:
+            content = paper.get("full_content", paper["summary"])
+            
+            prompt = f"""
+请评估以下论文与用户查询的相关性：
+
+用户查询: {query}
+
+论文标题: {paper['title']}
+论文摘要: {paper['summary'][:1000]}...
+
+请判断这篇论文是否与用户查询直接相关。考虑以下因素：
+1. 论文主题是否与查询一致
+2. 论文是否解决了查询中提到的问题或相关问题
+3. 论文的方法或技术是否适用于查询领域
+
+回答"相关"或"不相关"，并简要说明理由（不超过50字）。
+
+例如：
+相关 - 论文主题与查询完全匹配
+不相关 - 论文属于完全不同领域
+相关 - 虽然方法不同但解决相同问题
+"""
+
+            response = self.llm.invoke(prompt)
+            result = response.content.strip().lower()
+            
+            # 判断是否相关
+            is_relevant = "相关" in result or "relevant" in result
+            
+            if not is_relevant:
+                print(f"🗑️  过滤不相关论文: {paper['title'][:50]}...")
+            
+            return is_relevant
+        except Exception as e:
+            print(f"⚠️ 评估论文相关性时出错: {str(e)}, 默认认为相关")
+            return True  # 出错时默认认为相关
+    
+    def _search_additional_papers(self, original_query: str, needed_count: int, existing_papers: List[Dict]) -> List[Dict]:
+        """根据现有论文分析结果，调整关键词并搜索更多相关论文"""
+        try:
+            # 从现有论文中提取关键词和主题
+            existing_titles = [paper['title'] for paper in existing_papers]
+            existing_summaries = [paper['summary'][:500] for paper in existing_papers]
+            
+            prompt = f"""
+基于以下已检索到的论文，分析用户查询"{original_query}"的更精确关键词：
+
+已检索到的论文标题:
+{chr(10).join(existing_titles[:5])}
+
+已检索到的论文摘要:
+{chr(10).join(existing_summaries[:3])}
+
+请分析这些论文的共同特征，为原始查询"{original_query}"提供3-5个更精确的英文关键词或短语，
+以便检索到更相关的论文。只需要返回关键词，用OR连接，不需要解释。
+
+例如：machine learning OR deep learning OR neural networks
+"""
+
+            response = self.llm.invoke(prompt)
+            refined_query = response.content.strip()
+            
+            print(f"🔍 使用调整后的关键词搜索: {refined_query}")
+            
+            # 使用新关键词搜索论文
+            client = arxiv.Client()
+            two_years_ago = datetime.now().replace(tzinfo=None) - timedelta(days=365*2)
+            
+            search = arxiv.Search(
+                query=refined_query,
+                max_results=needed_count * 2,
+                sort_by=arxiv.SortCriterion.Relevance,
+                sort_order=arxiv.SortOrder.Descending
+            )
+            
+            results = list(client.results(search))
+            
+            # 筛选最近两年的论文
+            filtered_results = []
+            for result in results:
+                published_date = result.published.replace(tzinfo=None)
+                if published_date >= two_years_ago:
+                    filtered_results.append(result)
+                    
+            print(f"📅 筛选最近两年论文: {len(results)} -> {len(filtered_results)}")
+            
+            # 处理新论文
+            additional_papers = []
+            for result in filtered_results[:needed_count]:
+                try:
+                    paper = self._process_paper_result(result)
+                    # 再次检查相关性
+                    if self._evaluate_paper_relevance(paper, original_query):
+                        additional_papers.append(paper)
+                except Exception as e:
+                    print(f"⚠️ 处理补充论文时出错: {str(e)}")
+            
+            print(f"✅ 补充搜索完成，新增 {len(additional_papers)} 篇相关论文")
+            return additional_papers[:needed_count]
+        except Exception as e:
+            print(f"⚠️ 补充搜索时出错: {str(e)}")
+            return []
+    
+    def _process_paper_result(self, result):
+        """处理单个论文结果的辅助方法"""
+        print(f"📄 获取到论文: {result.title}")
+        paper = {
+            "title": result.title,
+            "authors": [author.name for author in result.authors],
+            "summary": result.summary,
+            "published": result.published.strftime("%Y-%m-%d"),
+            "pdf_url": result.pdf_url,
+            "entry_id": result.entry_id,
+            "categories": result.categories
+        }
+        
+        # 尝试提取PDF内容
+        if PDF_PROCESSING_AVAILABLE:
+            try:
+                print(f"📄 正在提取论文PDF内容: {result.title}")
+                paper["full_content"] = self._extract_pdf_content(result.pdf_url)
+                print(f"✅ 论文PDF内容提取完成: {result.title}")
+            except Exception as e:
+                print(f"⚠️ 提取PDF内容时出错: {str(e)}, 使用摘要内容")
+                paper["full_content"] = result.summary
+        else:
+            paper["full_content"] = result.summary
+            print(f"📄 使用论文摘要内容: {result.title}")
+        
+        return paper
     
     @traceable
     def _extract_pdf_content(self, pdf_url: str) -> str:
@@ -214,14 +391,35 @@ class ArxivReviewGenerator:
             content = ""
             pages_to_extract = min(20, len(pdf_reader.pages))
             print(f"📄 正在提取PDF前 {pages_to_extract} 页内容")
-            for i in range(pages_to_extract):
-                page = pdf_reader.pages[i]
-                content += page.extract_text() + "\n"
             
+            # 使用线程池并行提取PDF页面内容
+            page_contents = [""] * pages_to_extract
+            with ThreadPoolExecutor(max_workers=25) as executor:
+                # 提交所有页面提取任务
+                future_to_page = {
+                    executor.submit(self._extract_pdf_page, pdf_reader, i): i 
+                    for i in range(pages_to_extract)
+                }
+                
+                # 收集结果
+                for future in as_completed(future_to_page):
+                    try:
+                        page_index, page_text = future.result(timeout=120)
+                        page_contents[page_index] = page_text
+                    except Exception as e:
+                        page_index = future_to_page[future]
+                        print(f"⚠️ 提取第 {page_index} 页PDF内容时出错: {e}")
+            
+            content = "\n".join(page_contents)
             print("✅ PDF内容提取完成")
             return content
         except Exception as e:
             raise Exception(f"提取PDF内容失败: {str(e)}")
+    
+    def _extract_pdf_page(self, pdf_reader, page_index):
+        """提取PDF单页内容的辅助方法"""
+        page = pdf_reader.pages[page_index]
+        return page_index, page.extract_text() + "\n"
     
     @traceable
     def _extract_core_content(self, full_content: str) -> str:
@@ -266,21 +464,32 @@ class ArxivReviewGenerator:
         
         print(f"🔄 开始使用MapReduce方法分析 {len(papers)} 篇论文")
         # 将论文摘要转换为Document对象
+        
+        # 使用线程池并行提取核心内容
         docs = []
-        for i, paper in enumerate(papers):
-            # 提取核心内容替代摘要
-            print(f"📄 处理论文 {i+1}/{len(papers)}: {paper['title']}")
-            core_content = self._extract_core_content(paper.get("full_content", paper["summary"]))
+        with ThreadPoolExecutor(max_workers=25) as executor:
+            # 提交所有核心内容提取任务
+            future_to_index = {
+                executor.submit(self._create_document, paper, i, len(papers)): i 
+                for i, paper in enumerate(papers)
+            }
             
-            doc_content = f"""
-论文 {i+1}:
-标题: {paper['title']}
-作者: {', '.join(paper['authors'][:3])} 等
-发表日期: {paper['published']}
-分类: {', '.join(paper['categories'])}
-核心内容: {core_content}
-            """
-            docs.append(Document(page_content=doc_content))
+            # 收集结果
+            doc_results = []
+            for future in tqdm(as_completed(future_to_index), 
+                             total=len(future_to_index), 
+                             desc="提取论文核心内容", 
+                             colour="BLUE"):
+                try:
+                    doc = future.result(timeout=600)
+                    doc_results.append(doc)
+                except Exception as e:
+                    index = future_to_index[future]
+                    print(f"⚠️ 提取第 {index + 1} 篇论文核心内容时出错: {e}")
+            
+            # 按索引排序以保持原始顺序
+            doc_results.sort(key=lambda x: x[0])
+            docs = [doc for _, doc in doc_results]
         
         try:
             # 使用MapReduce链处理文档
@@ -290,13 +499,31 @@ class ArxivReviewGenerator:
             # Map阶段：对每篇论文进行分析
             print("🧠 开始Map阶段：逐篇分析论文")
             map_results = []
-            for i, doc in enumerate(docs):
-                print(f"🤖 正在调用LLM分析第 {i+1} 篇论文")
-                start_time = time.time()
-                result = map_chain.invoke({"context": doc.page_content})
-                end_time = time.time()
-                print(f"✅ 第 {i+1} 篇论文分析完成，耗时: {end_time - start_time:.2f}秒")
-                map_results.append(result)
+            
+            # 使用线程池并行分析论文
+            with ThreadPoolExecutor(max_workers=25) as executor:
+                # 提交所有分析任务
+                future_to_index = {
+                    executor.submit(self._analyze_single_paper, map_chain, doc, i): i 
+                    for i, doc in enumerate(docs)
+                }
+                
+                # 收集结果
+                analysis_results = []
+                for future in tqdm(as_completed(future_to_index), 
+                                 total=len(future_to_index), 
+                                 desc="分析论文", 
+                                 colour="YELLOW"):
+                    try:
+                        index, result = future.result(timeout=600)
+                        analysis_results.append((index, result))
+                    except Exception as e:
+                        index = future_to_index[future]
+                        print(f"⚠️ 分析第 {index + 1} 篇论文时出错: {e}")
+                
+                # 按索引排序以保持原始顺序
+                analysis_results.sort(key=lambda x: x[0])
+                map_results = [result for _, result in analysis_results]
             
             # Reduce阶段：综合分析所有结果
             print("🧠 开始Reduce阶段：综合分析所有论文")
@@ -312,6 +539,30 @@ class ArxivReviewGenerator:
         except Exception as e:
             return f"使用MapReduce分析论文时出错: {str(e)}"
     
+    def _create_document(self, paper, index, total):
+        """创建文档对象的辅助方法"""
+        print(f"📄 处理论文 {index+1}/{total}: {paper['title']}")
+        core_content = self._extract_core_content(paper.get("full_content", paper["summary"]))
+        
+        doc_content = f"""
+论文 {index+1}:
+标题: {paper['title']}
+作者: {', '.join(paper['authors'][:3])} 等
+发表日期: {paper['published']}
+分类: {', '.join(paper['categories'])}
+核心内容: {core_content}
+        """
+        return index, Document(page_content=doc_content)
+    
+    def _analyze_single_paper(self, map_chain, doc, index):
+        """分析单篇论文的辅助方法"""
+        print(f"🤖 正在调用LLM分析第 {index+1} 篇论文")
+        start_time = time.time()
+        result = map_chain.invoke({"context": doc.page_content})
+        end_time = time.time()
+        print(f"✅ 第 {index+1} 篇论文分析完成，耗时: {end_time - start_time:.2f}秒")
+        return index, result
+    
     @traceable
     def analyze_papers(self, papers: List[Dict]) -> str:
         """分析论文并提取关键信息"""
@@ -326,19 +577,31 @@ class ArxivReviewGenerator:
         # 构建论文信息总结
         print("🔄 步骤2: 构建论文详细信息")
         paper_summaries = []
-        for i, paper in enumerate(papers):
-            # 提取核心内容替代摘要
-            core_content = self._extract_core_content(paper.get("full_content", paper["summary"]))
+        
+        # 使用线程池并行提取核心内容
+        with ThreadPoolExecutor(max_workers=25) as executor:
+            # 提交所有核心内容提取任务
+            future_to_index = {
+                executor.submit(self._extract_summary, paper, i): i 
+                for i, paper in enumerate(papers)
+            }
             
-            summary = f"""
-论文 {i+1}:
-标题: {paper['title']}
-作者: {', '.join(paper['authors'][:3])} 等
-发表日期: {paper['published']}
-分类: {', '.join(paper['categories'])}
-核心内容: {core_content[:500]}...
-            """
-            paper_summaries.append(summary)
+            # 收集结果
+            summary_results = []
+            for future in tqdm(as_completed(future_to_index), 
+                             total=len(future_to_index), 
+                             desc="构建论文摘要", 
+                             colour="MAGENTA"):
+                try:
+                    index, summary = future.result(timeout=600)
+                    summary_results.append((index, summary))
+                except Exception as e:
+                    index = future_to_index[future]
+                    print(f"⚠️ 构建第 {index + 1} 篇论文摘要时出错: {e}")
+            
+            # 按索引排序以保持原始顺序
+            summary_results.sort(key=lambda x: x[0])
+            paper_summaries = [summary for _, summary in summary_results]
         
         prompt = f"""
 请分析以下{len(papers)}篇论文并提取关键信息：
@@ -370,6 +633,21 @@ MapReduce分析结果:
             return combined_analysis
         except Exception as e:
             return f"分析论文时出错: {str(e)}"
+    
+    def _extract_summary(self, paper, index):
+        """提取论文摘要的辅助方法"""
+        # 提取核心内容替代摘要
+        core_content = self._extract_core_content(paper.get("full_content", paper["summary"]))
+        
+        summary = f"""
+论文 {index+1}:
+标题: {paper['title']}
+作者: {', '.join(paper['authors'][:3])} 等
+发表日期: {paper['published']}
+分类: {', '.join(paper['categories'])}
+核心内容: {core_content[:500]}...
+        """
+        return index, summary
     
     @traceable
     def generate_review(self, topic: str, papers: List[Dict], analysis: str) -> str:
@@ -455,7 +733,7 @@ MapReduce分析结果:
             return f"保存文件时出错: {str(e)}"
     
     @traceable
-    def generate_review_for_topic(self, topic: str, max_papers: int = 5) -> str:
+    def generate_review_for_topic(self, topic: str, max_papers: int = max_papers) -> str:
         """为指定主题生成综述报告"""
         print(f"🔍 正在搜索关于'{topic}'的论文...")
         papers = self.search_papers(topic, max_papers)
@@ -534,12 +812,18 @@ def run_chat_mode():
         except Exception as e:
             print(f"❌ 发生错误: {str(e)}")
             print("🔧 请检查您的输入或网络连接后重试")
-
-
 def main():
     """主函数"""
+    # 如果提供了命令行参数，则直接处理该主题
+    import sys
+    if len(sys.argv) > 1:
+        topic = " ".join(sys.argv[1:])
+        generator = ArxivReviewGenerator()
+        filename = generator.generate_review_for_topic(topic)
+        print(f"🎉 文献综述已成功生成并保存至: {filename}")
+        return
+    
     run_chat_mode()
-
 
 if __name__ == "__main__":
     # 设置LangSmith环境变量（如果尚未设置）
